@@ -1,0 +1,1039 @@
+package config
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/gruntwork-io/terragrunt/internal/cas"
+	"github.com/gruntwork-io/terragrunt/internal/experiment"
+	inthclparse "github.com/gruntwork-io/terragrunt/internal/hclparse"
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
+	"github.com/gruntwork-io/terragrunt/internal/vfs"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+
+	"github.com/gruntwork-io/terragrunt/internal/ctyhelper"
+	"github.com/gruntwork-io/terragrunt/internal/worker"
+
+	"github.com/hashicorp/go-getter/v2"
+
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/hashicorp/hcl/v2/hclwrite"
+
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/gruntwork-io/terragrunt/internal/errors"
+	"github.com/gruntwork-io/terragrunt/pkg/config/hclparse"
+)
+
+const (
+	StackDir      = ".terragrunt-stack"
+	valuesFile    = "terragrunt.values.hcl"
+	manifestName  = ".terragrunt-stack-manifest"
+	unitDirPerm   = 0755
+	valueFilePerm = 0644
+)
+
+// StackConfigFile represents the structure of terragrunt.stack.hcl stack file.
+type StackConfigFile struct {
+	Locals   *terragruntLocal    `hcl:"locals,block"`
+	Includes []*StackIncludeFile `hcl:"include,block"`
+	Stacks   []*Stack            `hcl:"stack,block"`
+	Units    []*Unit             `hcl:"unit,block"`
+}
+
+// StackIncludeFile represents an include block in a stack file.
+type StackIncludeFile struct {
+	Name string `hcl:",label"`
+	Path string `hcl:"path,attr"`
+}
+
+// StackConfig represents the structure of terragrunt.stack.hcl stack file.
+type StackConfig struct {
+	Locals map[string]any
+	Stacks []*Stack
+	Units  []*Unit
+}
+
+// Unit represents unit from a stack file.
+type Unit struct {
+	Remain              hcl.Body   `hcl:",remain"`
+	UpdateSourceWithCAS *bool      `hcl:"update_source_with_cas,attr"`
+	NoStack             *bool      `hcl:"no_dot_terragrunt_stack,attr"`
+	NoValidation        *bool      `hcl:"no_validation,attr"`
+	Values              *cty.Value `hcl:"values,attr"`
+	Name                string     `hcl:",label"`
+	Source              string     `hcl:"source,attr"`
+	Path                string     `hcl:"path,attr"`
+}
+
+// Stack represents the stack block in the configuration.
+type Stack struct {
+	Remain              hcl.Body   `hcl:",remain"`
+	UpdateSourceWithCAS *bool      `hcl:"update_source_with_cas,attr"`
+	NoStack             *bool      `hcl:"no_dot_terragrunt_stack,attr"`
+	NoValidation        *bool      `hcl:"no_validation,attr"`
+	Values              *cty.Value `hcl:"values,attr"`
+	Name                string     `hcl:",label"`
+	Source              string     `hcl:"source,attr"`
+	Path                string     `hcl:"path,attr"`
+}
+
+// GenerateStackFile generates the Terragrunt stack configuration from the given stackFilePath,
+// reads necessary values, and generates units and stacks in the target directory.
+// It handles the creation of required directories and returns any errors encountered.
+func GenerateStackFile(ctx context.Context, l log.Logger, pctx *ParsingContext, pool *worker.Pool, stackFilePath string) error {
+	stackSourceDir := filepath.Dir(stackFilePath)
+
+	values, err := ReadValues(ctx, pctx, l, stackSourceDir)
+	if err != nil {
+		return errors.Errorf("failed to read values from directory %s: %w", stackSourceDir, err)
+	}
+
+	stackFile, err := ReadStackConfigFile(ctx, l, pctx, stackFilePath, values)
+	if err != nil {
+		return errors.Errorf("Failed to read stack file %s in %s %w", stackFilePath, stackSourceDir, err)
+	}
+
+	stackTargetDir := filepath.Join(stackSourceDir, StackDir)
+
+	// When the stack-dependencies experiment is enabled, perform a two-pass
+	// parse to resolve autoinclude blocks and generate terragrunt.autoinclude.hcl files.
+	var autoIncludes map[string]*inthclparse.AutoIncludeResolved
+
+	var stackSrcBytes []byte
+
+	if pctx.Experiments.Evaluate(experiment.StackDependencies) {
+		// Note: stackSrcBytes is read separately for the two-pass autoinclude parser
+		// which uses a simplified eval context. ReadStackConfigFile does the full parse
+		// with the complete Terragrunt eval context including functions.
+		stackSrcBytes, err = os.ReadFile(stackFilePath)
+		if err != nil {
+			return errors.Errorf("failed to read stack file bytes %s: %w", stackFilePath, err)
+		}
+
+		parseResult, parseErr := inthclparse.ParseStackFile(vfs.NewOSFS(), &inthclparse.ParseStackFileInput{Src: stackSrcBytes, Filename: stackFilePath, StackDir: stackSourceDir, Values: values})
+		if parseErr != nil {
+			// Detect autoinclude on the include-merged stackFile so the check works for include paths that use HCL functions/locals/values, where a raw-HCL nil-eval re-scan would fail.
+			if stackConfigHasAutoInclude(stackFile) {
+				return errors.Errorf("failed to parse autoinclude block(s) in %s: %w", stackFilePath, parseErr)
+			}
+
+			l.Tracef("Autoinclude parse skipped for %s: %v", stackFilePath, parseErr)
+		}
+
+		if parseErr == nil {
+			autoIncludes = parseResult.AutoIncludes
+		}
+	}
+
+	casEnabled := pctx.Experiments.Evaluate(experiment.CAS) && !pctx.NoCAS
+
+	if err := validateUpdateSourceWithCAS(stackFile, stackFilePath, casEnabled); err != nil {
+		return err
+	}
+
+	var casInstance *cas.CAS
+
+	if casEnabled {
+		if err := cas.ValidateCASCloneDepth(pctx.CASCloneDepth); err != nil {
+			return err
+		}
+
+		c, casErr := cas.New(cas.WithCloneDepth(pctx.CASCloneDepth))
+		if casErr != nil {
+			l.Warnf("Failed to initialize CAS for stack generation: %v. CAS features disabled.", casErr)
+
+			casEnabled = false
+		} else {
+			casInstance = c
+		}
+	}
+
+	genOpts := generateOpts{
+		rootWorkingDir:  pctx.RootWorkingDir,
+		logShowAbsPaths: pctx.Writers.LogShowAbsPaths,
+		sourceMap:       pctx.SourceMap,
+		noStackValidate: pctx.NoStackValidate,
+		stackConfigPath: pctx.TerragruntStackConfigPath,
+		sourceFile:      stackFilePath,
+		sourceDir:       stackSourceDir,
+		targetDir:       stackTargetDir,
+		autoIncludes:    autoIncludes,
+		stackSrcBytes:   stackSrcBytes,
+		casEnabled:      casEnabled,
+		casInstance:     casInstance,
+	}
+
+	if err := generateUnits(ctx, l, &genOpts, pool, stackFile.Units); err != nil {
+		return err
+	}
+
+	if err := generateStacks(ctx, l, &genOpts, pool, stackFile.Stacks); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateUpdateSourceWithCAS rejects stack files that declare update_source_with_cas = true
+// on any unit or stack when CAS is not available. The attribute is meaningless without CAS
+// and would otherwise silently fall through to the standard getter, producing confusing
+// "source not found" failures downstream.
+func validateUpdateSourceWithCAS(stackFile *StackConfig, stackFilePath string, casEnabled bool) error {
+	if casEnabled {
+		return nil
+	}
+
+	for _, unit := range stackFile.Units {
+		if unit.UpdateSourceWithCAS != nil && *unit.UpdateSourceWithCAS {
+			return errors.New(&cas.UpdateSourceWithCASRequiresCASError{
+				BlockType: "unit",
+				Name:      unit.Name,
+				Path:      stackFilePath,
+			})
+		}
+	}
+
+	for _, stack := range stackFile.Stacks {
+		if stack.UpdateSourceWithCAS != nil && *stack.UpdateSourceWithCAS {
+			return errors.New(&cas.UpdateSourceWithCASRequiresCASError{
+				BlockType: "stack",
+				Name:      stack.Name,
+				Path:      stackFilePath,
+			})
+		}
+	}
+
+	return nil
+}
+
+// generateOpts holds the subset of options needed for stack/unit generation.
+type generateOpts struct {
+	autoIncludes    map[string]*inthclparse.AutoIncludeResolved
+	casInstance     *cas.CAS
+	sourceMap       map[string]string
+	rootWorkingDir  string
+	stackConfigPath string
+	sourceFile      string
+	sourceDir       string
+	targetDir       string
+	stackSrcBytes   []byte
+	logShowAbsPaths bool
+	noStackValidate bool
+	casEnabled      bool
+}
+
+// generateUnits iterates through a slice of Unit objects, generating each one by copying
+// source files to their destination paths and writing unit-specific values.
+// It logs the generating progress and returns any errors encountered during the operation.
+func generateUnits(ctx context.Context, l log.Logger, opts *generateOpts, pool *worker.Pool, units []*Unit) error {
+	for _, unit := range units {
+		pool.Submit(func() error {
+			item := componentToGenerate{
+				sourceDir:    opts.sourceDir,
+				targetDir:    opts.targetDir,
+				name:         unit.Name,
+				path:         unit.Path,
+				source:       unit.Source,
+				values:       unit.Values,
+				noStack:      unit.NoStack != nil && *unit.NoStack,
+				noValidation: unit.NoValidation != nil && *unit.NoValidation,
+				kind:         unitKind,
+			}
+
+			l.Infof("Generating unit %s from %s", unit.Name, util.RelPathForLog(opts.rootWorkingDir, opts.sourceFile, opts.logShowAbsPaths))
+
+			return telemetry.TelemeterFromContext(ctx).Collect(ctx, "stack_generate_unit", map[string]any{
+				"stack_file":  opts.sourceFile,
+				"unit_name":   unit.Name,
+				"unit_source": unit.Source,
+				"unit_path":   unit.Path,
+			}, func(ctx context.Context) error {
+				return generateComponent(ctx, l, opts, &item)
+			})
+		})
+	}
+
+	return nil
+}
+
+// generateStacks generates each stack by resolving its destination path and copying files from the source.
+// It logs each operation and returns early if any error is encountered.
+func generateStacks(ctx context.Context, l log.Logger, opts *generateOpts, pool *worker.Pool, stacks []*Stack) error {
+	for _, stack := range stacks {
+		pool.Submit(func() error {
+			item := componentToGenerate{
+				sourceDir:    opts.sourceDir,
+				targetDir:    opts.targetDir,
+				name:         stack.Name,
+				path:         stack.Path,
+				source:       stack.Source,
+				noStack:      stack.NoStack != nil && *stack.NoStack,
+				noValidation: stack.NoValidation != nil && *stack.NoValidation,
+				values:       stack.Values,
+				kind:         stackKind,
+			}
+
+			l.Infof("Generating stack %s from %s", stack.Name, util.RelPathForLog(opts.rootWorkingDir, opts.sourceFile, opts.logShowAbsPaths))
+
+			return telemetry.TelemeterFromContext(ctx).Collect(ctx, "stack_generate_stack", map[string]any{
+				"stack_file":   opts.sourceFile,
+				"stack_name":   stack.Name,
+				"stack_source": stack.Source,
+				"stack_path":   stack.Path,
+			}, func(ctx context.Context) error {
+				return generateComponent(ctx, l, opts, &item)
+			})
+		})
+	}
+
+	return nil
+}
+
+type componentKind int
+
+const (
+	unitKind componentKind = iota
+	stackKind
+)
+
+// componentToGenerate represents an item of work for generating a stack or unit.
+// It contains information about the source and target directories, the name and path of the item, the source URL or path,
+// and any associated values that need to be generated.
+type componentToGenerate struct {
+	values       *cty.Value
+	sourceDir    string
+	targetDir    string
+	name         string
+	path         string
+	source       string
+	noStack      bool
+	noValidation bool
+	kind         componentKind
+}
+
+// resolveDestPath builds and validates the destination path for a generated component.
+func resolveDestPath(cmp *componentToGenerate, opts *generateOpts) (string, error) {
+	if filepath.IsAbs(cmp.path) {
+		return "", errors.Errorf("path %s must be relative", cmp.path)
+	}
+
+	// Compute destination: noStack components go to parent of targetDir,
+	// regular components go inside targetDir (.terragrunt-stack/).
+	baseDir := opts.targetDir
+	if cmp.noStack {
+		baseDir = filepath.Dir(opts.targetDir)
+	}
+
+	dest := filepath.Clean(filepath.Join(baseDir, cmp.path))
+
+	// Validate destination is within the allowed directory using filepath.Rel
+	// instead of strings.HasPrefix to avoid prefix-overlap bypasses.
+	rel, err := filepath.Rel(filepath.Clean(baseDir), dest)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", errors.Errorf("%s destination path '%s' is outside of the stack directory '%s'", cmp.name, dest, baseDir)
+	}
+
+	return dest, nil
+}
+
+// validateGeneratedComponent validates the generated component directory contains the expected config file.
+func validateGeneratedComponent(l log.Logger, cmp *componentToGenerate, opts *generateOpts, dest string) error {
+	kindStr := "unit"
+	if cmp.kind == stackKind {
+		kindStr = "stack"
+	}
+
+	if cmp.noStack {
+		l.Debugf("Skipping validation for %s %s due to no_stack flag", kindStr, cmp.name)
+
+		return nil
+	}
+
+	if cmp.noValidation {
+		l.Debugf("Skipping validation for %s %s due to no_validation flag", kindStr, cmp.name)
+
+		return nil
+	}
+
+	expectedFile := DefaultTerragruntConfigPath
+
+	if cmp.kind == stackKind {
+		expectedFile = DefaultStackFile
+	}
+
+	if err := validateTargetDir(kindStr, cmp.name, dest, expectedFile); err != nil {
+		if opts.noStackValidate {
+			l.Warnf("Suppressing validation error for %s %s at path %s: expected %s to generate with %s file at root of generated directory.", kindStr, cmp.name, opts.targetDir, kindStr, expectedFile)
+		} else {
+			return errors.Errorf("Validation failed for %s %s at path %s: expected %s to generate with %s file at root of generated directory.", kindStr, cmp.name, opts.targetDir, kindStr, expectedFile)
+		}
+	}
+
+	return nil
+}
+
+// generateAutoInclude writes the autoinclude file for a component if one was resolved.
+func generateAutoInclude(l log.Logger, opts *generateOpts, cmp *componentToGenerate, dest string) error {
+	if opts.autoIncludes == nil {
+		return nil
+	}
+
+	kind := inthclparse.KindUnit
+	if cmp.kind == stackKind {
+		kind = inthclparse.KindStack
+	}
+
+	resolved, ok := opts.autoIncludes[inthclparse.AutoIncludeKey(kind, cmp.name)]
+	if !ok {
+		return nil
+	}
+
+	l.Infof("Generating %s for %s %s", inthclparse.AutoIncludeFileNameForKind(kind), kind, cmp.name)
+
+	if err := inthclparse.GenerateAutoIncludeFile(vfs.NewOSFS(), resolved, dest, resolved.SourceBytes, resolved.EvalCtx); err != nil {
+		return errors.Errorf("failed to write autoinclude for %s %s: %w", kind, cmp.name, err)
+	}
+
+	return nil
+}
+
+// generateComponent copies files from the source directory to the target destination and generates a corresponding values file.
+func generateComponent(ctx context.Context, l log.Logger, opts *generateOpts, cmp *componentToGenerate) error {
+	source := cmp.source
+	// Adjust source path using the provided source mapping configuration if available
+	source, err := adjustSourceWithMap(opts.sourceMap, source, opts.stackConfigPath)
+	if err != nil {
+		return errors.Errorf("failed to adjust source %s: %w", cmp.source, err)
+	}
+
+	dest, err := resolveDestPath(cmp, opts)
+	if err != nil {
+		return err
+	}
+
+	kindStr := "unit"
+	if cmp.kind == stackKind {
+		kindStr = "stack"
+	}
+
+	l.Debugf("Generating: %s (%s) to %s", cmp.name, source, dest)
+
+	if err := fetchComponentSource(ctx, l, opts, cmp, kindStr, source, dest); err != nil {
+		return err
+	}
+
+	if err := validateGeneratedComponent(l, cmp, opts, dest); err != nil {
+		return err
+	}
+
+	// generate values file
+	if err := writeValues(l, cmp.values, dest); err != nil {
+		return errors.Errorf("failed to write values %v %w", cmp.name, err)
+	}
+
+	return generateAutoInclude(l, opts, cmp, dest)
+}
+
+// fetchComponentSource handles the paths for fetching a component's source:
+//  1. cas:: protocol source: materialize the CAS tree directly. Must run before the CAS-backed
+//     branch so nested components already rewritten to cas:: are not re-fetched.
+//  2. Source with CAS enabled: attempt a CAS-backed fetch (remote clone or local copy into a
+//     temp overlay) and copy from its content dir. This fires automatically whenever the cas
+//     experiment is on, so catalog authors don't need consumers to opt in per-block. On any CAS
+//     failure (for example, CAS can't handle a go-getter query param like depth=1), we fall
+//     through to the standard getter.
+//  3. Standard: local copy or remote getter.
+//
+// The update_source_with_cas attribute on a consumer block is a no-op under path 2. It only
+// matters inside catalog files, where the CAS walk uses it to decide which nested sources to
+// rewrite to cas:: references.
+func fetchComponentSource(
+	ctx context.Context,
+	l log.Logger,
+	opts *generateOpts,
+	cmp *componentToGenerate,
+	kindStr, source, dest string,
+) error {
+	if isCASProtocol(source) {
+		if !opts.casEnabled {
+			return errors.Errorf("cas:: source on %s %q requires the 'cas' experiment to be enabled", kindStr, cmp.name)
+		}
+
+		if err := os.MkdirAll(dest, os.ModePerm); err != nil {
+			return errors.Errorf("Failed to create directory %s for %s %w", dest, cmp.name, err)
+		}
+
+		// Strip the cas:: prefix and parse the hash
+		casRef := strings.TrimPrefix(source, cas.CASProtocolPrefix)
+
+		hash, err := cas.ParseCASRef(casRef)
+		if err != nil {
+			return errors.Errorf("Failed to parse CAS reference for %s %s: %w", kindStr, cmp.name, err)
+		}
+
+		if err := opts.casInstance.MaterializeTree(ctx, l, hash, dest); err != nil {
+			return errors.Errorf("Failed to materialize CAS tree for %s %s: %w", kindStr, cmp.name, err)
+		}
+
+		return nil
+	}
+
+	if opts.casEnabled {
+		casErr := fetchViaCAS(ctx, l, opts, cmp.sourceDir, kindStr, source, dest)
+		if casErr == nil {
+			return nil
+		}
+
+		l.Warnf("CAS processing failed for %s %q: %v. Falling back to standard getter.", kindStr, cmp.name, casErr)
+	}
+
+	if err := copyFiles(ctx, l, cmp.name, cmp.sourceDir, source, dest); err != nil {
+		return errors.Errorf(
+			"Failed to fetch %s %s\n"+
+				"  Source:      %s\n"+
+				"  Destination: %s\n\n"+
+				"Troubleshooting:\n"+
+				"  1. Check if your source path is correct relative to the stack file location\n"+
+				"  2. Verify the units or stacks directory exists at the expected location\n"+
+				"  3. Ensure you have proper permissions to read from source and write to destination\n\n"+
+				"Original error: %w",
+			kindStr,
+			cmp.name,
+			source,
+			dest,
+			err,
+		)
+	}
+
+	return nil
+}
+
+// fetchViaCAS performs the CAS-backed fetch, rewrite, and copy for a stack component.
+// For remote sources the fetch is a CAS-backed git clone; for local sources it is a
+// copy into a temp overlay so rewrites do not mutate the caller's working tree.
+func fetchViaCAS(
+	ctx context.Context,
+	l log.Logger,
+	opts *generateOpts,
+	sourceDir, kindStr, source, dest string,
+) error {
+	resolvedSource := resolveLocalCASSource(l, sourceDir, source)
+
+	result, err := opts.casInstance.ProcessStackComponent(ctx, l, resolvedSource, kindStr)
+	if err != nil {
+		return err
+	}
+
+	defer result.Cleanup()
+
+	// A copy failure can leave partial content in dest, so reset it before
+	// falling through to the standard getter. ProcessStackComponent writes only
+	// to its own temp dir, so failures before this point never touch dest.
+	if copyErr := util.CopyFolderContentsWithFilter(l, result.ContentDir, dest, manifestName, func(_ string) bool {
+		return true
+	}); copyErr != nil {
+		if cleanupErr := os.RemoveAll(dest); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			l.Debugf("Failed to clean partial CAS destination %s: %v", dest, cleanupErr)
+		}
+
+		return copyErr
+	}
+
+	return nil
+}
+
+// resolveLocalCASSource normalizes a relative local source against sourceDir so
+// ProcessStackComponent's filepath.Abs/Stat resolve against the stack file
+// rather than the process CWD. Remote sources, absolute paths, and any source
+// that doesn't look like a local path are returned unchanged. The "//" subdir
+// suffix used by go-getter is preserved.
+func resolveLocalCASSource(l log.Logger, sourceDir, source string) string {
+	if source == "" || sourceDir == "" {
+		return source
+	}
+
+	basePath, subdir := getter.SourceDirSubdir(source)
+	if filepath.IsAbs(basePath) || !isLocal(l, sourceDir, basePath) {
+		return source
+	}
+
+	abs, err := filepath.Abs(filepath.Join(sourceDir, basePath))
+	if err != nil {
+		return source
+	}
+
+	if subdir != "" {
+		return abs + "//" + subdir
+	}
+
+	return abs
+}
+
+// isCASProtocol checks if a source string uses the CAS protocol (cas::sha1:<hash>).
+func isCASProtocol(source string) bool {
+	return strings.HasPrefix(source, cas.CASProtocolPrefix)
+}
+
+// copyFiles copies files or directories from a source to a destination path.
+//
+// The function checks if the source is local or remote. If local, it copies the
+// contents of the source directory to the destination. If remote, it fetches the
+// source and stores it in the destination directory.
+func copyFiles(ctx context.Context, l log.Logger, identifier, sourceDir, src, dest string) error {
+	if isLocal(l, sourceDir, src) {
+		// check if src is absolute path, if not, join with sourceDir
+		var localSrc string
+
+		if filepath.IsAbs(src) {
+			localSrc = src
+		} else {
+			localSrc = filepath.Join(sourceDir, src)
+		}
+
+		localSrc = filepath.Clean(localSrc)
+
+		if err := util.CopyFolderContentsWithFilter(l, localSrc, dest, manifestName, func(absolutePath string) bool {
+			return true
+		}); err != nil {
+			return errors.Errorf("Failed to copy %s to %s %w", localSrc, dest, err)
+		}
+	} else {
+		if err := os.MkdirAll(dest, os.ModePerm); err != nil {
+			return errors.Errorf("Failed to create directory %s for %s %w", dest, identifier, err)
+		}
+
+		if _, err := getter.GetAny(ctx, dest, src); err != nil {
+			return errors.Errorf("Failed to fetch %s %s for %s %w", src, dest, identifier, err)
+		}
+	}
+
+	return nil
+}
+
+// isLocal determines if a given source path is local or remote.
+//
+// It checks if the provided source file exists locally. If not, it checks if
+// the path is relative to the working directory. If that also fails, the function
+// attempts to detect the source's getter type and recognizes if it is a file URL.
+func isLocal(l log.Logger, workingDir, src string) bool {
+	// check initially if the source is a local file
+	if util.FileExists(src) {
+		return true
+	}
+
+	src = filepath.Join(workingDir, src)
+	if util.FileExists(src) {
+		return true
+	}
+	// check path through getters
+	req := &getter.Request{
+		Src: src,
+	}
+	for _, g := range getter.Getters {
+		recognized, err := getter.Detect(req, g)
+		if err != nil {
+			l.Debugf("Error detecting getter for %s: %v", src, err)
+			continue
+		}
+
+		if recognized {
+			break
+		}
+	}
+
+	return strings.HasPrefix(req.Src, "file://")
+}
+
+// ReadOutputs retrieves the OpenTofu/Terraform output JSON for this unit, converts it into a map of cty.Values,
+// and logs the operation for debugging. It returns early in case of any errors during retrieval or conversion.
+func (u *Unit) ReadOutputs(ctx context.Context, l log.Logger, pctx *ParsingContext, unitDir string) (map[string]cty.Value, error) {
+	configPath := filepath.Join(unitDir, DefaultTerragruntConfigPath)
+	l.Debugf("Getting output from unit %s in %s", u.Name, unitDir)
+
+	jsonBytes, err := getOutputJSONWithCaching(ctx, pctx, l, configPath)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	outputMap, err := TerraformOutputJSONToCtyValueMap(configPath, jsonBytes)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	return outputMap, nil
+}
+
+// ReadStackConfigFile reads and parses a Terragrunt stack configuration file from the given path.
+// It creates a parsing context, processes locals, and decodes the file into a StackConfig struct.
+// Validation is performed on the resulting config, and any encountered errors cause an early return.
+func ReadStackConfigFile(ctx context.Context, l log.Logger, pctx *ParsingContext, filePath string, values *cty.Value) (*StackConfig, error) {
+	l.Debugf("Reading Terragrunt stack config file at %s", filePath)
+
+	stackPctx := pctx.Clone()
+	stackPctx.TerragruntConfigPath = filePath
+	stackPctx.OriginalTerragruntConfigPath = filePath
+
+	file, err := hclparse.NewParser(stackPctx.ParserOptions...).ParseFromFile(filePath)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	return ParseStackConfig(ctx, l, stackPctx, file, values)
+}
+
+// ReadStackConfigString reads and parses a Terragrunt stack configuration from a string.
+func ReadStackConfigString(
+	ctx context.Context,
+	l log.Logger,
+	pctx *ParsingContext,
+	configPath string,
+	configString string,
+	values *cty.Value,
+) (*StackConfig, error) {
+	if values != nil {
+		pctx = pctx.WithValues(values)
+	}
+
+	hclFile, err := hclparse.NewParser(pctx.ParserOptions...).ParseFromString(configString, configPath)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	return ParseStackConfig(ctx, l, pctx, hclFile, values)
+}
+
+// ParseStackConfig parses the stack configuration from the given file and values.
+func ParseStackConfig(ctx context.Context, l log.Logger, parser *ParsingContext, file *hclparse.File, values *cty.Value) (*StackConfig, error) {
+	if values != nil {
+		parser = parser.WithValues(values)
+	}
+
+	if err := processLocals(ctx, l, parser, file); err != nil {
+		return nil, errors.New(err)
+	}
+
+	evalParsingContext, err := createTerragruntEvalContext(ctx, parser, l, file.ConfigPath)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	config := &StackConfigFile{}
+	if decodeErr := file.Decode(config, evalParsingContext); decodeErr != nil {
+		return nil, errors.New(decodeErr)
+	}
+
+	// Process include blocks when the stack-dependencies experiment is enabled.
+	if parser.Experiments.Evaluate(experiment.StackDependencies) {
+		if err := processStackConfigIncludes(config, filepath.Dir(file.ConfigPath), evalParsingContext, parser.ParserOptions); err != nil {
+			return nil, err
+		}
+	}
+
+	localsParsed := map[string]any{}
+
+	if parser.Locals != nil {
+		var err error
+
+		localsParsed, err = ctyhelper.ParseCtyValueToMap(*parser.Locals)
+		if err != nil {
+			return nil, errors.New(err)
+		}
+	}
+
+	stackConfig := &StackConfig{
+		Locals: localsParsed,
+		Stacks: config.Stacks,
+		Units:  config.Units,
+	}
+
+	if err := ValidateStackConfig(config); err != nil {
+		return nil, errors.New(err)
+	}
+
+	return stackConfig, nil
+}
+
+// processStackConfigIncludes resolves include blocks during stack file parsing.
+// It reads each included file, parses it with the same eval context, and merges
+// its units and stacks into the main config so generation sees all components,
+// not just those in the root file.
+func processStackConfigIncludes(config *StackConfigFile, stackDir string, evalCtx *hcl.EvalContext, parserOpts []hclparse.Option) error {
+	for _, inc := range config.Includes {
+		includePath := inc.Path
+		if !filepath.IsAbs(includePath) {
+			includePath = filepath.Join(stackDir, includePath)
+		}
+
+		incFile, err := hclparse.NewParser(parserOpts...).ParseFromFile(includePath)
+		if err != nil {
+			return errors.Errorf("failed to read include %q: %w", inc.Name, err)
+		}
+
+		included := &StackConfigFile{}
+		if decodeErr := incFile.Decode(included, evalCtx); decodeErr != nil {
+			return errors.Errorf("failed to decode include %q: %w", inc.Name, decodeErr)
+		}
+
+		if included.Locals != nil {
+			return errors.Errorf("included stack file %q must not define locals", inc.Name)
+		}
+
+		if len(included.Includes) > 0 {
+			return errors.Errorf("included stack file %q must not define nested includes", inc.Name)
+		}
+
+		config.Units = append(config.Units, included.Units...)
+		config.Stacks = append(config.Stacks, included.Stacks...)
+	}
+
+	// Validate no duplicate unit names after merge.
+	seen := make(map[string]struct{}, len(config.Units))
+
+	for _, u := range config.Units {
+		if _, exists := seen[u.Name]; exists {
+			return inthclparse.DuplicateUnitNameError{Name: u.Name}
+		}
+
+		seen[u.Name] = struct{}{}
+	}
+
+	// Validate no duplicate stack names after merge.
+	seen = make(map[string]struct{}, len(config.Stacks))
+
+	for _, s := range config.Stacks {
+		if _, exists := seen[s.Name]; exists {
+			return inthclparse.DuplicateStackNameError{Name: s.Name}
+		}
+
+		seen[s.Name] = struct{}{}
+	}
+
+	return nil
+}
+
+// writeValues generates and writes values to a terragrunt.values.hcl file in the specified directory.
+func writeValues(l log.Logger, values *cty.Value, directory string) error {
+	if values == nil {
+		l.Debugf("No values to write in %s", directory)
+		return nil
+	}
+	// Avoid panics if the provided values are in unsupported format
+	if values.IsNull() {
+		l.Debugf("Skipping writing values in %s: values is null", directory)
+		return nil
+	}
+
+	if !values.IsWhollyKnown() {
+		l.Debugf("Skipping writing values in %s: values are not fully known", directory)
+		return nil
+	}
+
+	valType := values.Type()
+
+	if !valType.IsObjectType() && !valType.IsMapType() {
+		return errors.Errorf("writeValues: expected object or map, got %s", valType.FriendlyName())
+	}
+
+	if directory == "" {
+		return errors.New("writeValues: unit directory path cannot be empty")
+	}
+
+	if err := os.MkdirAll(directory, unitDirPerm); err != nil {
+		return errors.Errorf("failed to create directory %s: %w", directory, err)
+	}
+
+	l.Debugf("Writing values file in %s", directory)
+	filePath := filepath.Join(directory, valuesFile)
+
+	file := hclwrite.NewEmptyFile()
+	body := file.Body()
+	body.AppendUnstructuredTokens([]*hclwrite.Token{
+		{
+			Type:  hclsyntax.TokenComment,
+			Bytes: []byte("# Auto-generated by the terragrunt.stack.hcl file by Terragrunt. Do not edit manually\n"),
+		},
+	})
+
+	// Sort keys for deterministic output
+	valueMap := values.AsValueMap()
+
+	keys := make([]string, 0, len(valueMap))
+	for key := range valueMap {
+		keys = append(keys, key)
+	}
+
+	// Sort keys alphabetically
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		body.SetAttributeValue(key, valueMap[key])
+	}
+
+	if err := os.WriteFile(filePath, file.Bytes(), valueFilePerm); err != nil {
+		return errors.Errorf("failed to write values file %s: %w", filePath, err)
+	}
+
+	return nil
+}
+
+// ReadValues reads values from the terragrunt.values.hcl file in the specified directory.
+func ReadValues(ctx context.Context, pctx *ParsingContext, l log.Logger, directory string) (*cty.Value, error) {
+	if directory == "" {
+		return nil, errors.New("ReadValues: directory path cannot be empty")
+	}
+
+	filePath := filepath.Join(directory, valuesFile)
+
+	if util.FileNotExists(filePath) {
+		return nil, nil
+	}
+
+	l.Debugf("Reading Terragrunt stack values file at %s", filePath)
+
+	file, err := hclparse.NewParser(pctx.ParserOptions...).ParseFromFile(filePath)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	evalParsingContext, err := createTerragruntEvalContext(ctx, pctx, l, file.ConfigPath)
+	if err != nil {
+		return nil, errors.New(err)
+	}
+
+	values := map[string]cty.Value{}
+
+	if err := file.Decode(&values, evalParsingContext); err != nil {
+		return nil, errors.New(err)
+	}
+
+	result := cty.ObjectVal(values)
+
+	return &result, nil
+}
+
+// processLocals processes the locals block in the stack file.
+func processLocals(ctx context.Context, l log.Logger, parser *ParsingContext, file *hclparse.File) error {
+	localsBlock, err := file.Blocks(MetadataLocals, false)
+	if err != nil {
+		return errors.New(err)
+	}
+
+	if len(localsBlock) == 0 {
+		return nil
+	}
+
+	if len(localsBlock) > 1 {
+		return errors.New(fmt.Sprintf("up to one locals block is allowed per stack file, but found %d in %s", len(localsBlock), file.ConfigPath))
+	}
+
+	attrs, err := localsBlock[0].JustAttributes()
+	if err != nil {
+		return errors.New(err)
+	}
+
+	evaluatedLocals := map[string]cty.Value{}
+	evaluated := true
+
+	for iterations := 0; len(attrs) > 0 && evaluated; iterations++ {
+		if iterations > MaxIter {
+			// Reached maximum supported iterations, which is most likely an infinite loop bug so cut the iteration
+			// short and return an error.
+			return errors.New(MaxIterError{})
+		}
+
+		var evalErr error
+
+		attrs, evaluatedLocals, evaluated, evalErr = attemptEvaluateLocals(
+			ctx,
+			parser,
+			l,
+			file,
+			attrs,
+			evaluatedLocals,
+		)
+		if evalErr != nil {
+			l.Debugf("Encountered error while evaluating locals in file %s", util.RelPathForLog(parser.RootWorkingDir, file.ConfigPath, parser.Writers.LogShowAbsPaths))
+
+			return errors.New(evalErr)
+		}
+	}
+
+	localsAsCtyVal, err := ConvertValuesMapToCtyVal(evaluatedLocals)
+	if err != nil {
+		return errors.New(err)
+	}
+
+	parser.Locals = &localsAsCtyVal
+
+	return nil
+}
+
+// validateTargetDir target destination directory.
+func validateTargetDir(kind, name, destDir, expectedFile string) error {
+	expectedPath := filepath.Join(destDir, expectedFile)
+
+	info, err := os.Stat(expectedPath)
+	if err != nil {
+		return fmt.Errorf("%s '%s': expected file '%s' not found in target directory '%s': %w", kind, name, expectedFile, destDir, err)
+	}
+
+	if info.IsDir() {
+		return fmt.Errorf("%s '%s': expected file '%s' is a directory, not a file", kind, name, expectedFile)
+	}
+
+	return nil
+}
+
+// GetUnitDir returns the directory path for a unit based on its no_dot_terragrunt_stack setting.
+func GetUnitDir(dir string, unit *Unit) string {
+	if unit.NoStack != nil && *unit.NoStack {
+		return filepath.Join(dir, unit.Path)
+	}
+
+	return filepath.Join(dir, StackDir, unit.Path)
+}
+
+// stackConfigHasAutoInclude reports whether any unit or stack in the include-merged stack config declares an autoinclude block.
+func stackConfigHasAutoInclude(stackFile *StackConfig) bool {
+	if stackFile == nil {
+		return false
+	}
+
+	for _, u := range stackFile.Units {
+		if u != nil && hasAutoIncludeInBody(u.Remain) {
+			return true
+		}
+	}
+
+	for _, s := range stackFile.Stacks {
+		if s != nil && hasAutoIncludeInBody(s.Remain) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasAutoIncludeInBody reports whether the given remain body contains a top-level autoinclude block. Only native HCL syntax bodies (*hclsyntax.Body) are inspected; JSON-format stack files return false because autoinclude blocks are only supported in native HCL.
+func hasAutoIncludeInBody(body hcl.Body) bool {
+	syntaxBody, ok := body.(*hclsyntax.Body)
+	if !ok {
+		return false
+	}
+
+	for _, block := range syntaxBody.Blocks {
+		if block.Type == "autoinclude" {
+			return true
+		}
+	}
+
+	return false
+}
